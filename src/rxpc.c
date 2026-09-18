@@ -728,6 +728,7 @@ struct rxpc_conn {
   uint32_t next_file_stream;
   uint32_t file_send_window;
   uint32_t file_stream;
+  int peer_settings_seen;
 };
 
 static _Thread_local char rxpc_last_err[1024];
@@ -992,6 +993,7 @@ static int rxpc_pump(rxpc_conn *c, int timeout_ms) {
       case H2_FRAME_SETTINGS:
         if (!(flags & H2_FLAG_ACK)) {
           (void)apply_settings(c, fb, flen);
+          c->peer_settings_seen = 1;
           processed = 1;
         }
 
@@ -1068,6 +1070,8 @@ static void frame_window_update(buf *b, uint32_t stream, uint32_t incr) {
   (void)buf_append(b, wb, 4);
 }
 
+static int rxpc_pump(rxpc_conn *c, int timeout_ms);
+
 static int perform_handshake(rxpc_conn *c) {
   buf b;
   buf_init(&b, 512);
@@ -1116,9 +1120,20 @@ static int perform_handshake(rxpc_conn *c) {
     free(m.d);
   }
 
-  frame_settings(&b, H2_FLAG_ACK, NULL, 0);
-
   int rc = write_all(c->fd, b.d, b.len);
+  free(b.d);
+  if (rc != 0) return rc;
+
+  for (int i = 0; i < 100 && !c->peer_settings_seen; i++) {
+    if (rxpc_pump(c, 100) < 0) return -1;
+  }
+  if (!c->peer_settings_seen) return -1;
+
+  b.d = NULL;
+  b.len = 0;
+  b.cap = 0;
+  frame_settings(&b, H2_FLAG_ACK, NULL, 0);
+  rc = write_all(c->fd, b.d, b.len);
   free(b.d);
   return rc;
 }

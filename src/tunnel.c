@@ -1171,14 +1171,14 @@ static int utun_configure(const char *ifname, const char *addr, uint32_t mtu, co
   if (system(cmd) != 0) return -1;
   snprintf(cmd, sizeof(cmd), "/sbin/ifconfig %s mtu %u", ifname, mtu);
   if (system(cmd) != 0) return -1;
-  snprintf(cmd, sizeof(cmd), "/sbin/route -n add -inet6 %s/128 -interface %s", server, ifname);
+  snprintf(cmd, sizeof(cmd), "/sbin/route -n add -inet6 %s/128 -interface %s >/dev/null 2>&1", server, ifname);
   if (system(cmd) != 0) return -1;
   return 0;
 }
 
 static void utun_remove_route(const char *server) {
   char cmd[1024];
-  snprintf(cmd, sizeof(cmd), "/sbin/route -n delete -inet6 %s/128", server);
+  snprintf(cmd, sizeof(cmd), "/sbin/route -n delete -inet6 %s/128 >/dev/null 2>&1", server);
   (void)system(cmd);
 }
 
