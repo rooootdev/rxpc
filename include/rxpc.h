@@ -59,6 +59,11 @@ typedef struct rxpc_value {
       uint8_t *bytes;
       size_t len;
     } raw;
+
+    struct {
+      uint64_t transfer_id;
+      size_t transfer_size;
+    } transfer;
   };
 } rxpc_value;
 
@@ -70,6 +75,7 @@ rxpc_value *rxpc_double(double v);
 rxpc_value *rxpc_string(const char *s);
 rxpc_value *rxpc_data(const void *bytes, size_t len);
 rxpc_value *rxpc_uuid(const void *bytes16);
+rxpc_value *rxpc_file_transfer(size_t size, uint64_t transfer_id);
 rxpc_value *rxpc_array(void);
 rxpc_value *rxpc_dict(void);
 
@@ -96,6 +102,7 @@ int rxpc_connected(const rxpc_conn *c);
 const char *rxpc_error(const rxpc_conn *c);
 rxpc_value *rxpc_recv(rxpc_conn *c, int timeout_ms, uint32_t *out_flags, uint64_t *out_id);
 int rxpc_send(rxpc_conn *c, uint32_t flags, uint64_t id, const rxpc_value *body);
+int rxpc_send_file_transfer(rxpc_conn *c, uint64_t transfer_id, const void *data, size_t len, int timeout_ms);
 
 typedef struct rxpc_service {
   char *name;

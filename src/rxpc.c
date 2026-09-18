@@ -39,8 +39,10 @@
 #define H2_FRAME_GOAWAY 0x07u
 #define H2_FRAME_WINDOW_UPDATE 0x08u
 #define H2_FLAG_END_HEADERS 0x04u
+#define H2_FLAG_END_STREAM 0x01u
 #define H2_FLAG_ACK 0x01u
 #define H2_FLAG_PADDED 0x08u
+#define RXPC_FLAG_FILE_TX_STREAM_REQUEST 0x00100000u
 
 #define H2_SETTINGS_MAX_CONCURRENT_STREAMS 0x03u
 #define H2_SETTINGS_INITIAL_WINDOW_SIZE 0x04u
@@ -236,6 +238,15 @@ rxpc_value *rxpc_uuid(const void *bytes16) {
   return v;
 }
 
+rxpc_value *rxpc_file_transfer(size_t size, uint64_t transfer_id) {
+  rxpc_value *v = val_new(RXPC_FILE_TRANSFER);
+  if (v) {
+    v->transfer.transfer_id = transfer_id;
+    v->transfer.transfer_size = size;
+  }
+  return v;
+}
+
 rxpc_value *rxpc_array(void) { return val_new(RXPC_ARRAY); }
 rxpc_value *rxpc_dict(void) { return val_new(RXPC_DICT); }
 
@@ -283,8 +294,9 @@ void rxpc_value_free(rxpc_value *v) {
       break;
     case RXPC_DATA:
     case RXPC_UUID:
-    case RXPC_FILE_TRANSFER:
       free(v->data.bytes);
+      break;
+    case RXPC_FILE_TRANSFER:
       break;
     case RXPC_ARRAY:
       for (size_t i = 0; i < v->array.count; i++) rxpc_value_free(v->array.items[i]);
@@ -318,11 +330,7 @@ static rxpc_value *clone_impl(const rxpc_value *v) {
     case RXPC_DATA: return rxpc_data(v->data.bytes, v->data.len);
     case RXPC_UUID: return rxpc_uuid(v->data.bytes);
     case RXPC_FILE_TRANSFER: {
-      rxpc_value *n = val_new(RXPC_FILE_TRANSFER);
-      n->raw.bytes = malloc(v->raw.len ? v->raw.len : 1);
-      memcpy(n->raw.bytes, v->raw.bytes, v->raw.len);
-      n->raw.len = v->raw.len;
-      return n;
+      return rxpc_file_transfer(v->transfer.transfer_size, v->transfer.transfer_id);
     }
     case RXPC_ARRAY: {
       rxpc_value *n = rxpc_array();
@@ -457,7 +465,27 @@ static int xenc_value(buf *b, const rxpc_value *v) {
 
       return rc;
     }
-    case RXPC_FILE_TRANSFER:
+    case RXPC_FILE_TRANSFER: {
+      buf inner;
+      buf_init(&inner, 32);
+
+      rxpc_value *size = rxpc_uint(v->transfer.transfer_size);
+      rxpc_value *dict = rxpc_dict();
+      if (!size || !dict || rxpc_dict_set(dict, "s", size) != 0 || xenc_value(&inner, dict) != 0) {
+        rxpc_value_free(size);
+        rxpc_value_free(dict);
+        buf_free(&inner);
+        return -1;
+      }
+
+      b_le32(b, RXPC_FILE_TRANSFER);
+      b_le64(b, v->transfer.transfer_id);
+      int rc = buf_append(b, inner.d, inner.len);
+      rxpc_value_free(dict);
+      buf_free(&inner);
+
+      return rc;
+    }
     default:
       return -1;
   }
@@ -656,22 +684,17 @@ static rxpc_value *xdec_val(const uint8_t *d, size_t len, size_t *off) {
       return dict;
     }
     case RXPC_FILE_TRANSFER: {
-      uint32_t dl = rd_le32(d, len, off);
-      if (dl == 0xffffffffu || need(d, len, off, dl) != 0) return NULL;
-
-      rxpc_value *v = val_new(RXPC_FILE_TRANSFER);
-      v->raw.bytes = malloc(dl ? dl : 1);
-      memcpy(v->raw.bytes, d + *off, dl);
-      v->raw.len = dl;
-      *off += dl;
-      size_t pad = pad4(dl);
-      if (need(d, len, off, pad) != 0) {
-        rxpc_value_free(v);
+      uint64_t id = rd_le64(d, len, off);
+      rxpc_value *meta = xdec_val(d, len, off);
+      if (!meta || meta->type != RXPC_DICT) {
+        rxpc_value_free(meta);
         return NULL;
       }
 
-      *off += pad;
-
+      const rxpc_value *size = rxpc_dict_get(meta, "s");
+      rxpc_value *v = size && size->type == RXPC_UINT ? rxpc_file_transfer((size_t)size->u, id) : NULL;
+      rxpc_value_free(meta);
+      
       return v;
     }
     default:
@@ -702,6 +725,9 @@ struct rxpc_conn {
   struct msg *qhead;
   struct msg *qtail;
   uint64_t next_msg_id;
+  uint32_t next_file_stream;
+  uint32_t file_send_window;
+  uint32_t file_stream;
 };
 
 static _Thread_local char rxpc_last_err[1024];
@@ -882,12 +908,15 @@ static int apply_settings(rxpc_conn *c, const uint8_t *body, size_t n) {
       case H2_SETTINGS_INITIAL_WINDOW_SIZE:
         c->root_send_window = val;
         c->reply_send_window = val;
+        c->file_send_window = val;
         break;
       default:
         break;
     }
+
     off += 6;
   }
+
   return 0;
 }
 
@@ -974,6 +1003,8 @@ static int rxpc_pump(rxpc_conn *c, int timeout_ms) {
           if (stream == 0) c->conn_send_window += incr;
           else if (stream == ROOT_STREAM) c->root_send_window += incr;
           else if (stream == REPLY_STREAM) c->reply_send_window += incr;
+          else if (stream == c->file_stream) c->file_send_window += incr;
+
           processed = 1;
         }
 
@@ -982,6 +1013,11 @@ static int rxpc_pump(rxpc_conn *c, int timeout_ms) {
       case H2_FRAME_RST_STREAM:
         {
           uint32_t code = flen >= 4 ? ((uint32_t)fb[0] << 24) | ((uint32_t)fb[1] << 16) | ((uint32_t)fb[2] << 8) | fb[3] : 0;
+          if ((stream & 1u) && stream >= 5 && stream < c->next_file_stream) {
+            processed = 1;
+            break;
+          }
+
           set_err(c, "peer sent RST_STREAM (error %u)", code);
 
           return -1;
@@ -1096,6 +1132,8 @@ rxpc_conn *rxpc_connect(const char *host, const char *port, int timeout_ms) {
   c->conn_send_window = H2_DEFAULT_PEER_WINDOW;
   c->root_send_window = H2_DEFAULT_PEER_WINDOW;
   c->reply_send_window = H2_DEFAULT_PEER_WINDOW;
+  c->next_file_stream = 5;
+  c->file_send_window = H2_DEFAULT_PEER_WINDOW;
   buf_init(&c->inbuf, 4096);
   buf_init(&c->pending1, 256);
   buf_init(&c->pending3, 256);
@@ -1259,6 +1297,80 @@ int rxpc_send(rxpc_conn *c, uint32_t flags, uint64_t id, const rxpc_value *body)
   }
 
   free(m.d);
+  return 0;
+}
+
+int rxpc_send_file_transfer(rxpc_conn *c, uint64_t transfer_id, const void *data, size_t len, int timeout_ms) {
+  if (!c || !c->connected || (!data && len)) {
+    set_err(c, "invalid file transfer", "");
+    return -1;
+  }
+
+  const uint32_t stream = c->next_file_stream;
+  c->next_file_stream += 2;
+  c->file_stream = stream;
+  if (send_frame(c, H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, stream, NULL, 0) != 0) {
+    set_err(c, "file transfer HEADERS write failed: %s", strerror(errno));
+    return -1;
+  }
+
+  buf preamble;
+  buf_init(&preamble, 32);
+  xenc_message(&preamble, RXPC_FLAG_ALWAYS_SET | RXPC_FLAG_FILE_TX_STREAM_REQUEST, transfer_id, NULL);
+  size_t off = 0;
+
+  while (off < preamble.len) {
+    uint32_t win = c->conn_send_window;
+    if (c->file_send_window < win) win = c->file_send_window;
+    if (c->peer_max_frame && win > c->peer_max_frame) win = c->peer_max_frame;
+    if (win == 0) {
+      if (rxpc_pump(c, timeout_ms) < 0) { buf_free(&preamble); return -1; }
+      continue;
+    }
+
+    size_t n = preamble.len - off;
+    if (n > win) n = win;
+    if (send_frame(c, H2_FRAME_DATA, 0, stream, preamble.d + off, n) != 0) {
+      set_err(c, "file transfer preamble write failed: %s", strerror(errno));
+      buf_free(&preamble);
+      return -1;
+    }
+
+    c->conn_send_window -= (uint32_t)n;
+    c->file_send_window -= (uint32_t)n;
+    off += n;
+  }
+
+  buf_free(&preamble);
+
+  off = 0;
+  while (off < len) {
+    uint32_t win = c->conn_send_window;
+    if (c->file_send_window < win) win = c->file_send_window;
+    if (c->peer_max_frame && win > c->peer_max_frame) win = c->peer_max_frame;
+    if (win == 0) {
+      if (rxpc_pump(c, timeout_ms) < 0) return -1;
+      continue;
+    }
+
+    size_t n = len - off;
+    if (n > win) n = win;
+    if (send_frame(c, H2_FRAME_DATA, 0, stream, (const uint8_t *)data + off, n) != 0) {
+      set_err(c, "file transfer data write failed: %s", strerror(errno));
+      return -1;
+    }
+
+    c->conn_send_window -= (uint32_t)n;
+    c->file_send_window -= (uint32_t)n;
+    off += n;
+  }
+
+  if (send_frame(c, H2_FRAME_DATA, H2_FLAG_END_STREAM, stream, NULL, 0) != 0) {
+    set_err(c, "file transfer close write failed: %s", strerror(errno));
+    return -1;
+  }
+
+  c->file_stream = 0;
   return 0;
 }
 
